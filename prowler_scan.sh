@@ -56,8 +56,8 @@ AWSACCOUNT_LIST="thisaccount"
 #AWSACCOUNT_LIST_FILE="file_with_account_ids"
 
 #Specify the regions to have assessed (space separated) or use the keyword allregions to include all regions:
-REGION_LIST="allregions"
-#REGION_LIST="us-east-1 us-east-2"
+#REGION_LIST="allregions"
+REGION_LIST="ap-south-1"
 
 #Specify an IAM Role to use for cross account access in the target accounts (Execution Role):
 IAM_CROSS_ACCOUNT_ROLE="ProwlerExecRole"
