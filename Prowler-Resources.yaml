@@ -1,0 +1,509 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Deploys an EC2 Instance (Configured via user data), S3 bucket, IAM Role, and SNS Topic for use with Prowler. 
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetId
+      - Label:
+          default: "EC2 Configuration"
+        Parameters:
+          - InstanceType
+          - InstanceImageId
+          - KeyPairName
+          - PermittedSSHInbound
+      - Label:
+          default: "S3 Configuration"
+        Parameters:
+          - BucketName
+          - EmailAddress          
+      - Label:
+          default: "IAM Configuration"
+        Parameters:
+          - IAMProwlerEC2Role
+          - IAMProwlerExecRole
+      - Label:
+          default: "Prowler Script"
+        Parameters:
+          - Parallelism
+          - FindingOutput
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Select a VPC
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Select a private subnet with Internet access. (user data is dependent on Internet for downloading binaries during EC2 provisioning)
+  InstanceImageId:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Description: Amazon Linux 2023 Image
+    Default: "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+  InstanceType:
+    Type: String
+    Description: "Specify the instance size to use. Parallel_Account Sizing: AWS: 8=r6i.large, 12=r6i.xlarge, 16=r6i.2xlarge / AWS-CN: Use r5 equivalent"
+    Default: t3.micro
+    AllowedValues:
+      - r6i.large
+      - r6i.xlarge
+      - r6i.2xlarge
+      - r5.large
+      - r5.xlarge
+      - r5.2xlarge
+      - t3.micro
+  BucketName:
+    Type: String
+    Description: Specify the Bucket Name for the Prowler output (Account ID and Region will be appended)
+    Default: prowler-output
+  EmailAddress:
+    Type: String
+    Description: "Optional: If you wish to receive a notification when Prowler is completed and has uploaded the zip file containing findings, enter an email address and accept the topic subscription before Prowler completes the assessment"
+  IAMProwlerEC2Role:
+    Type: "String"
+    Description: "Name of IAM Role to be created for use with the Prowler EC2 Instance. This role's ARN is used with the ProwlerExecRole CFN template"
+    Default: "ProwlerEC2Role"
+  IAMProwlerExecRole:
+    Type: "String"
+    Description: "Name of IAM Role to be assumed in the member accounts. This name must match the IAM Role deployed via the ProwlerExecRole CFN template"
+    Default: "ProwlerExecRole"
+  Parallelism:
+    Type: String
+    Description: "Specify the number of accounts to assess in parallel. Appropriate Instance Type and Size must be selected (can be adjusted within prowler_scan.sh)"
+    Default: 12
+    AllowedValues:
+      - 1
+      - 2
+      - 4
+      - 6
+      - 8
+      - 10
+      - 12
+      - 14
+      - 16
+      - 18
+  FindingOutput:
+    Type: String
+    Description: "If you want to exclude pass results, select FailOnly. This significantly reduces the output size and focuses on the checks that might need to be resolved. If you want to include pass results, select FailAndPass."
+    Default: "FailOnly"
+    AllowedValues:
+      - "FailOnly"
+      - "FailAndPass"
+  KeyPairName:
+    Type: "String"
+    Description: "Optional: Specify the name of a pre-existing EC2 KeyPair if you require ssh to the Prowler instance.  Recommendation is to leave blank and use SSM Connect"
+  PermittedSSHInbound:
+    Type: "String"
+    Description: "Optional: If allowing inbound SSH, specify the permitted CIDR else leave the default 127.0.0.1"
+    Default: "127.0.0.1/32"
+
+Mappings: 
+  PartitionMap: 
+    aws:
+      ec2service: ec2.amazonaws.com
+    aws-us-gov:
+      ec2service: ec2.amazonaws.com
+    aws-cn:
+      ec2service: ec2.amazonaws.com.cn
+
+  FindingOutputMap: 
+    FailOnly:
+      value: "'--status FAIL'"
+    FailAndPass:
+      value: ""
+
+Conditions:
+  KeyProvided:
+    Fn::Not:
+      - Fn::Equals:
+          - ""
+          - Ref: KeyPairName
+
+  EmailProvided:
+    Fn::Not:
+      - Fn::Equals:
+          - ""
+          - Ref: EmailAddress
+
+Resources:
+  ProwlerEC2RolePolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W13
+            reason: "The resource must remain as * in order to assess all IAM Users."
+          - id: W28
+            reason: "The IAM Role name is specified as an explicit for use within the scripting"
+    Properties:
+      Description: !Sub "This policy grants necessary permissions to assume ${IAMProwlerExecRole} in AWS accounts"
+      ManagedPolicyName: !Sub "${IAMProwlerEC2Role}Policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement: #Actions below are given against all resources as per Prowler requirements to grant the appropriate level of read-only access to resources
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Resource: !Sub "arn:${AWS::Partition}:iam::*:role/${IAMProwlerExecRole}"
+          - Effect: Allow
+            Action:
+              - account:Get*
+              - appstream:Describe*
+              - appstream:List*
+              - backup:List*
+              - cloudtrail:GetInsightSelectors
+              - codeartifact:List*
+              - codebuild:BatchGet*
+              - drs:Describe*
+              - ds:Get*
+              - ds:Describe*
+              - ds:List*
+              - ec2:GetEbsEncryptionByDefault
+              - ecr:Describe*
+              - ecr:GetRegistryScanningConfiguration
+              - elasticfilesystem:DescribeBackupPolicy
+              - glue:GetConnections
+              - glue:GetSecurityConfiguration*
+              - glue:SearchTables
+              - lambda:GetFunction*
+              - logs:FilterLogEvents
+              - macie2:GetMacieSession
+              - s3:GetAccountPublicAccessBlock
+              - shield:DescribeProtection
+              - shield:GetSubscriptionState
+              - securityhub:BatchImportFindings
+              - securityhub:GetFindings
+              - ssm:GetDocument
+              - ssm-incidents:List*
+              - support:Describe*
+              - tag:GetTagKeys
+              - wellarchitected:List*
+              - organizations:DescribeOrganization
+              - organizations:ListPolicies*
+              - organizations:DescribePolicy
+              - organizations:ListDelegatedAdministrators
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - apigateway:GET
+            Resource:
+              - !Sub "arn:${AWS::Partition}:apigateway:*::/restapis/*"
+              - !Sub "arn:${AWS::Partition}:apigateway:*::/apis/*"
+          - Effect: Allow
+            Action:
+              - "s3:PutObject*"
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${S3Bucket}/*"
+      Roles:
+        - Ref: "ProwlerEC2Role"
+
+  ProwlerEC2Role:
+    Type: "AWS::IAM::Role"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "The IAM Role name is specified as an explicit for use within the scripting"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - !FindInMap [PartitionMap, !Ref "AWS::Partition", ec2service]
+            Action:
+              - "sts:AssumeRole"
+      Description: "This role grants necessary permissions for the Prowler EC2 instance to assume roles in accounts"
+      MaxSessionDuration: 43200
+      ManagedPolicyArns: #SecurityAudit and ViewOnly Access are used as per Prowler requirements to grant the appropriate level of read-only access to resources
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/SecurityAudit"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/job-function/ViewOnlyAccess"
+      Path: "/"
+      RoleName: !Sub "${IAMProwlerEC2Role}"
+
+  RootInstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "The IAM Role name is specified as an explicit for use within the scripting"
+    Properties:
+      InstanceProfileName: !Sub "${IAMProwlerEC2Role}"
+      Path: "/"
+      Roles:
+        - Ref: "ProwlerEC2Role"
+
+  ProwlerSNSTopic:
+    Condition: EmailProvided
+    Type: AWS::SNS::Topic
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W47
+            reason: "The SNS Topic is used to send a notification when the Prowler Assessment is completed and an object is uploaded to S3"
+    Properties:
+      TopicName: ProwlerNotifications
+
+  ProwlerSNSSubscription:
+    Condition: EmailProvided
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref EmailAddress
+      TopicArn: !Ref ProwlerSNSTopic
+      
+  ProwlerSNSTopicPolicy:
+    Condition: EmailProvided
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource:
+              Ref: ProwlerSNSTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Sub "${AWS::AccountId}"
+      Topics:
+        - !Ref ProwlerSNSTopic
+
+  S3EventRule:
+    Condition: EmailProvided
+    Type: "AWS::Events::Rule"
+    Properties:
+      Description: Prowler S3 Bucket Event
+      Name: ProwlerS3BucketEvent
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+            - !Ref S3Bucket
+      State: ENABLED
+      Targets:
+        - Arn: !Ref ProwlerSNSTopic
+          Id: ProwlerSNSTopic
+          InputTransformer:
+            InputPathsMap:
+              "s3bucket": "$.detail.bucket.name"
+              "s3objectkey": "$.detail.object.key"
+            InputTemplate: |
+              "Prowler assessment has completed and the report has been uploaded to the S3 Bucket."
+              "Please download and process the findings"
+              "S3 Bucket Name: <s3bucket>"
+              "S3 Object Key: <s3objectkey>"
+          RetryPolicy:
+            MaximumRetryAttempts: 4
+            MaximumEventAgeInSeconds: 400
+
+  ProwlerSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "The Security Group name is specified explicitly."
+          - id: W5
+            reason: "The Security Group has egress rules with cidr open to world to download packages from repos."
+    Properties:
+      GroupDescription: "Security Group which allows outbound Internet and SSM access"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - Description: "Download packages from Internet, SSM Connect, and write to S3"
+          IpProtocol: "tcp"
+          FromPort: "443"
+          ToPort: "443"
+          CidrIp: 0.0.0.0/0
+        - Description: "DNS resolution"
+          IpProtocol: "udp"
+          FromPort: "53"
+          ToPort: "53"
+          CidrIp: 0.0.0.0/0
+        - Description: "NTP Time Sync"
+          IpProtocol: "udp"
+          FromPort: "123"
+          ToPort: "123"
+          CidrIp: 0.0.0.0/0
+      SecurityGroupIngress:
+        - Description: "Inbound SSH"
+          IpProtocol: "tcp"
+          FromPort: "22"
+          ToPort: "22"
+          CidrIp: !Ref PermittedSSHInbound
+      GroupName: "prowler-sg"
+      Tags:
+        - Key: "Name"
+          Value: "prowler-sg"
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt ProwlerEC2Role.Arn
+            Action: "s3:PutObject"
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${S3Bucket}/*"
+          - Sid: Deny non-HTTPS access
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${S3Bucket}"
+              - !Sub "arn:${AWS::Partition}:s3:::${S3Bucket}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  S3Bucket:
+    Type: "AWS::S3::Bucket"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: "S3 access logging is not enable as the bucket is used once for finding download."
+    Properties:
+      BucketName: !Sub "${BucketName}-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "AES256"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+        - Id: LoggingLifeCycle
+          Status: Enabled
+          ExpirationInDays: '365'
+          NoncurrentVersionExpirationInDays: '365'
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      Tags:
+        - Key: "Name"
+          Value: !Sub "${BucketName}-${AWS::AccountId}-${AWS::Region}"
+
+  LaunchTemplate:
+    Type: "AWS::EC2::LaunchTemplate"
+    Properties:
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpTokens: "required"
+
+  Ec2Instance:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId:
+        Ref: "InstanceImageId"
+      InstanceType: !Ref InstanceType
+      BlockDeviceMappings:
+        - DeviceName: "/dev/xvda"
+          Ebs:
+            VolumeSize: "24"
+            DeleteOnTermination: true
+            VolumeType: "gp3"
+            Encrypted: true
+      SubnetId: !Ref SubnetId
+      IamInstanceProfile: !Ref IAMProwlerEC2Role
+      LaunchTemplate:
+        LaunchTemplateId:
+          Ref: "LaunchTemplate"
+        Version: "1"
+      Monitoring: true
+      KeyName:
+        Fn::If:
+          - KeyProvided
+          - Ref: KeyPairName
+          - Ref: AWS::NoValue
+      SecurityGroupIds:
+        - !GetAtt "ProwlerSG.GroupId"
+      UserData:
+        Fn::Base64: !Sub
+          - |+
+            #!/bin/bash
+
+            #Upgrade the OS
+            sudo dnf upgrade -y
+
+            #Create Linux swap of 16GB (128X64=8GB(BS=128 is optimal for creation))
+            sudo dd if=/dev/zero of=/swapfile bs=128M count=64
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile
+            sudo swapon /swapfile
+            echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
+
+            #Add /usr/local/bin to root path
+            echo 'export PATH="/usr/local/bin:$PATH"' >> /root/.bashrc
+            
+            #Install script and Prowler dependencies
+            sudo dnf install -y jq git pip openssl-devel bzip2-devel libffi-devel gcc git zlib-devel
+
+            #Replace the OS base awscli with the latest version
+            sudo yum remove awscli -y
+
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip awscliv2.zip
+            sudo ./aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli --update
+
+            sudo ln -s /usr/local/bin/aws /usr/bin/aws
+
+            #Clone Multi-Account-Security-Assessment Repo
+            cd /usr/local
+            git clone https://github.com/aws-samples/multi-account-security-assessment-via-prowler prowler
+
+            #Upgrade pip and install pipenv
+            cd /usr/local/prowler
+
+            #Install Prowler via pip3
+            pip install prowler==4.*
+
+            #Reinstall OS based Python modules altered during Prowler and dependency install
+            sudo dnf reinstall python3-colorama python3-dateutil -y
+
+            #Set script to be executable
+            chmod +x /usr/local/prowler/prowler_scan.sh
+
+            #Replace default script variable values in /usr/local/prowler/prowler_scan.sh with parameters configured during CFT deploy
+            #Note: This occurs ONCE during EC2 deployment and must be manually configured after deploy if additional tuning is required
+            #       Multiple individual sed commands used for readability
+            sed -i 's/PARALLELISM="12"/PARALLELISM="${Parallelism}"/' /usr/local/prowler/prowler_scan.sh
+            sed -i 's/IAM_CROSS_ACCOUNT_ROLE="ProwlerExecRole"/IAM_CROSS_ACCOUNT_ROLE="${IAMProwlerExecRole}"/' /usr/local/prowler/prowler_scan.sh
+            sed -i 's/S3_BUCKET="SetBucketName"/S3_BUCKET="${S3Bucket}"/' /usr/local/prowler/prowler_scan.sh
+            sed -i "s/FINDING_OUTPUT='--status FAIL'/FINDING_OUTPUT=${FindingOutputValue}/" /usr/local/prowler/prowler_scan.sh
+
+          - FindingOutputValue : !FindInMap [FindingOutputMap, Ref: FindingOutput, value]
+
+      Tags:
+        - Key: "Name"
+          Value: "ProwlerEC2"
+
+Outputs:
+  ProwlerEC2Role:
+    Description: ARN of the ProwlerEC2Role IAM Role
+    Value: !GetAtt ProwlerEC2Role.Arn
+  S3Bucket:
+    Description: ARN of the Prowler S3 Bucket
+    Value: !GetAtt S3Bucket.Arn
